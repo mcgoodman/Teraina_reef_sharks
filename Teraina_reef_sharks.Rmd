@@ -1,0 +1,1770 @@
+---
+title: "Teraina Reef Shark Population Model"
+author: "Maurice Goodman"
+date: "2024"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r include = FALSE}
+load_pkg <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+  }
+  require(pkg, character.only = TRUE)
+}
+
+pkgs <- c("tidyverse", "rstan", "tidybayes", "bayesplot", "here", "fishmethods", "GGally", "cowplot", "ggtext")
+lapply(pkgs, load_pkg)
+
+knitr::opts_chunk$set(
+  fig.height = 4, fig.width = 6, 
+  fig.path = paste0(here("figures"), "/"),
+  dev = "png", dpi = 500,
+  message = FALSE, warning = FALSE
+)
+
+theme_set(
+  theme_bw() + 
+    theme(
+      strip.background = element_blank(), 
+      strip.placement = "outside", 
+      axis.text = element_text(color = "black"), 
+      axis.ticks = element_line(color = "black"), 
+      panel.grid.minor = element_blank()
+    )
+)
+```
+
+# Input Parameter Estimation
+
+## Von Bertalanffy Growth Curve
+
+Using individual shark length data from [Bradley et al. (2017)](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0172370), we fit a Von Bertalanffy growth curve:
+
+$$
+L(t) = L_\infty - (L_\infty - L_o) \times \exp(-k \cdot t)
+$$
+
+in order to estimate the growth coefficient $k$ and the asymptotic length $L_\infty$. Bradley et al. use 60cm for the the length at birth, $L_o$. For an individual observed at time $t$ and $t + \delta$, the recursion giving the length at time $t + \delta$ is:
+
+$$
+L_{t + \delta} = L_\infty (1 - \exp(-k \cdot \delta)) + L_t(\exp(-k \cdot \delta))
+$$
+
+For each shark observed at time $t_1$ and $t_2$ with lengths $L_1$ and $L_2$, we can calculate the yearly growth rate by subtracting $L_1$ from $L_2$ and dividing by the time in years, allowing us to obtain initial parameter estimates for $k$ and $L_\infty$ using linear regression:
+
+$$
+\begin{aligned}
+\Delta L &= L_{t + 1} - L_t \approx (L_2 - L_1)/(t_2 - t_1)\\
+L_{t + 1} &= L_\infty (1 - \exp(-k)) + L_t(\exp(-k)) \\
+L_t + (L_{t + 1} - L_t) &=
+L_\infty (1 - \exp(-k)) + L_t(\exp(-k)) - L_t + L_t\ \\
+L_{t} + \Delta L &= \underbrace{L_\infty (1 - \exp(-k))}_{\text{intercept}} + L_t\underbrace{(\exp(-k))}_{\text{slope}} \\ \\
+\text{with } \; k &= -\log(\text{slope}) \; \text{ and } \; 
+L_\infty = \frac{\text{intercept}}{(1 - \text{slope})}
+\end{aligned}
+$$
+
+```{r}
+shark_lengths <- read.csv("./data/Bradley_et_al_Teraina_sharks_length_data.csv")
+
+shark_lengths <- shark_lengths |>  
+  mutate(dt = (T2 - T1) / 365, 
+         dLdt = (L2 - L1)/dt, 
+         L1_dLdt = L1 + dLdt)
+```
+
+```{r echo = FALSE}
+shark_lengths |> 
+  ggplot(aes(L1, dLdt)) + 
+  geom_point() + 
+  labs(title = "growth rate vs. length at capture")
+```
+
+
+Obtaining initial parameter estimates:
+
+```{r}
+vbge_lm <- lm(L1_dLdt ~ L1, data = shark_lengths)
+k_init <- as.numeric(-log(coef(vbge_lm)[2]))
+Linf_init <- as.numeric(coef(vbge_lm)[1]/(1 - coef(vbge_lm)[2]))
+```
+
+Nonlinear least squares:
+
+```{r}
+vbge_nls <- nls(
+  L2 ~ Linf*(1-exp(-k*dt)) + L1*exp(-k*dt), 
+  data = shark_lengths, 
+  start = list(Linf = Linf_init, k = k_init)
+)
+
+Lo <- 60 ## length at age 0
+(Linf_fit <- as.numeric(coef(vbge_nls)["Linf"]))
+(k_fit <- as.numeric(coef(vbge_nls)["k"]))
+```
+
+Plotting the fitted growth curve:
+
+```{r}
+vbge <- function(a, Linf, k, Lo) {
+  Linf - (Linf - Lo) * exp(-k * a)
+}
+
+vbge_curve <- tibble(
+  age = 0:60, length = vbge(age, Linf = Linf_fit, k = k_fit, Lo = 60)
+)
+```
+
+```{r echo = FALSE}
+vbge_curve |> 
+  ggplot(aes(age, length)) + 
+  geom_line() + 
+  labs(x = "Age (years)", y = "Length (cm)", title = "Von Bertalanffy Growth Curve")
+```
+
+
+## Length & Age at Maturity
+
+We can compute life span as the age at which sharks reach 95% of their maximum length (Bradley. et al. compute life span at 99% $L_\infty$):
+
+```{r}
+L_tmax <- as.numeric(0.95 * Linf_fit)
+(tmax <- (-1/k_fit) * log((Linf_fit - L_tmax)/(Linf_fit - Lo)))
+```
+
+Using the empirical coefficients given by [Frisk et al. (2001)](https://cdnsciencepub.com/doi/abs/10.1139/f01-051), we can obtain estimates of the length at maturity as a function of $L_\text{max}$:
+
+```{r}
+(L_mat <- 3.29 + 0.7 * L_tmax)
+```
+
+After obtaining the length at maturity using the Fisk equation, we can plug this value back in and solve for the age at maturity using our fitted growth curve:
+
+```{r}
+(age_mat <- -log((Linf_fit - L_mat)/(Linf_fit - Lo))/k_fit)
+```
+
+## Mortality and Finite Growth Rate
+
+The linear Hoenig (1983) equations provide empirical estimates of total mortality ($M$) from $t_\text{max}$:
+
+$$
+\ln(M) = a + b \ln(t_\text{max})
+$$
+
+Using the parameters for teleost fishes $(a = 1.46, b = -1.01)$, we have:
+
+```{r}
+(M_tel = exp(1.46 - 1.01 * log(tmax)))
+```
+
+With the parameters for cetaceans $(a = 0.941, b = -0.873)$, we have:
+
+```{r}
+(M_cet = exp(0.941 - 0.873 * log(tmax)))
+```
+
+We can use our estimated mortalities to derive the fraction of individuals surviving at age $a$:
+
+$$
+s(a) = e^{-\mu a}
+$$
+
+Then, we can use the Euler-Lotka equation to solve for $\lambda$:
+
+$$
+1 = \frac{1}{2} \sum_{a = 1}^{\infty} \lambda^{-a} s(a) f(a)
+$$
+
+Where $f(a)$ is the fecundity at age - (the right hand side is multiplied by $\frac{1}{2}$ to account for the sex ratio). We'll assume that the fecundity is:
+
+$$
+f(a) = \begin{cases} 
+0 & a < t_\text{mat} \\
+\bar{f} & a \geq t_\text{mat}
+\end{cases}
+$$
+
+With $\bar{f} = 4.1$, following [Wetherbee et al (1997)](https://www.jstor.org/stable/24857701?seq=1#metadata_info_tab_contents). Solving for $\lambda$ using the teleost and cetacean mortality estimates:
+
+```{r}
+#' Euler-Lotka Equation
+#' @lambda finite growth rate
+#' @x age
+#' @mu mortality
+#' @afr age at first reproduction
+#' @f_mean mean fecundity
+euler_lotka <-  function(lambda = 1, x, mu, afr, f_mean) {
+  s <- exp(-mu * x)
+  f <- ifelse(x >= afr, 0.5 * f_mean, 0)
+  sum(s * f * lambda^(-x)) - 1
+}
+
+age_seq <- seq(0, 100, 1) ## ages for which to compute s(a) & f(a)
+
+f_mean <- 4.1 ## mean fecundity
+
+## Finite growth rate from teleost mortality
+lambda_hoenig_tel <- uniroot(
+  euler_lotka, c(0.001, 5), x = age_seq, mu = M_tel, 
+  afr = ceiling(age_mat), f_mean = f_mean
+)
+
+lambda_hoenig_tel$root
+```
+
+```{r}
+## Finite growth rate from cetacean mortality
+lambda_hoenig_cet <- uniroot(
+  euler_lotka, c(0.001, 5), x = age_seq, mu = M_cet, 
+  afr = ceiling(age_mat), f_mean = f_mean
+)
+
+lambda_hoenig_cet$root
+```
+
+Additional methods for estimating $\lambda$ are provided by the `fishmethods` package. The teleost estimate for the Hoenig equation is close to the one computed above. Pauly (1980) requires temperature, for now we'll assume 28.5$^\circ$C:
+
+```{r}
+TC <- 27.8 ## Pauly (1980) method requires water temperature
+
+M_ests <- M.empirical(
+  Linf = Linf_fit, Kl = k_fit, TC = TC, tmax = tmax, 
+  tm = ceiling(age_mat), method = c(1, 3, 4, 5, 10, 11)
+)
+
+lambda_ests <- data.frame(
+  method = c("Hoenig (1983) - Cetacean Equation", rownames(M_ests)), 
+  mortality = c(M_cet, as.numeric(M_ests)), 
+  lambda = c(lambda_hoenig_cet$root, rep(NA, length(M_ests)))
+)
+
+for (i in 1:length(M_ests)) {
+  lambda_i <- uniroot(
+    euler_lotka, c(0.001, 5), x = age_seq, mu = M_ests[i], 
+    afr = ceiling(age_mat), f_mean = f_mean
+  )
+  lambda_ests$lambda[lambda_ests$method == rownames(M_ests)[i]] <- lambda_i$root
+}
+
+lambda_ests$method <- 
+  sapply(strsplit(lambda_ests$method, "-"), \(x) paste(trimws(x), collapse = " - "))
+
+knitr::kable(mutate_if(lambda_ests, is.numeric, round, digits = 4))
+```
+
+Taking the mean and standard error from these 7 methods (ignoring Roff 1984, which is implausibly low), we get:
+
+```{r}
+lambda_ests <- lambda_ests |> filter(lambda > 1.01)
+(lambda_mean <- mean(lambda_ests$lambda))
+(lambda_sd <- sd(lambda_ests$lambda))
+```
+
+Setting a shifted Gamma distribution to define a prior for $\lambda$ to fix $\lambda \geq 1$:
+
+```{r}
+# Shape and rate parameters for lambda
+lambda_alpha <- ((lambda_mean - 1)^2)/(lambda_sd^2)
+lambda_beta <- (lambda_mean - 1)/(lambda_sd^2)
+```
+
+```{r fig.width = 7, echo = FALSE}
+xlim <- 1 + qgamma(0.999, shape = lambda_alpha, rate = lambda_beta)
+
+lambda_ests |> 
+  ggplot(aes(lambda, dgamma(lambda - 1, shape = lambda_alpha, rate = lambda_beta))) +
+  stat_function(fun = \(x) dgamma(x - 1, shape = lambda_alpha, rate = lambda_beta), 
+                geom = "area", alpha = 0.2, fill = "black", n = 1000) + 
+  geom_text(aes(label = method), hjust = 0, nudge_x = 0.005, size = 3) + 
+  scale_x_continuous(limits = c(1, xlim)) + 
+  geom_point() + 
+  labs(x = expression(lambda), y = "Prior density")
+```
+
+
+# Data
+
+```{r read_data, results = "hide"}
+CPUE_data <- read_csv(here("data", "reported_cpue.csv"))
+boat_data <- read_csv(here("data", "boats.csv"))
+fin_catch_data <- read_csv(here("data", "fin_catch_data.csv"))
+fin_id_data <- read_csv(here("data", "fin_species_ids.csv"))
+pop_data <- data.frame(
+  year = c(1947, 1963, 1968, 1973, 1978, 1985, 1990, 1995, 2000, 2005, 2010, 2015, 2020), 
+  population = c(158, 373, 437, 458, 416, 451, 936, 978, 1087, 1155, 1690, 1712, 1893)
+)
+```
+
+These data are from interviews conducted with fishers on Teraina (Central Pacific, Northern Line Islands). At the time the data were collected, there were 8 active fishing vessels and 17 active fishers on the island. The number of active fishing vessels is known for all years prior (stored in `boat_data`), and the catch-per-unit-effort (CPUE) from fisher interviews is stored in `CPUE_data`.
+
+The number of motorized fishing boats on the island is known over the same time range, and reaches a maximum of 8 boats in 2013:
+
+```{r boat_data}
+years <- 1980:2015
+
+## Function to carry last observation in vector forward
+loocf <- function(x) {
+  last_obs <- x[1]
+  for (i in 1:length(x)) {
+    if(is.na(x[i])) { x[i] <- last_obs } else { last_obs <- x[i] }
+  }
+  x
+}
+
+### Expand boat data to have one observation for each year
+boat_data <- boat_data |>
+  mutate(year = factor(year, levels = years)) |>
+  complete(year, fill = list(nboats = NA)) |>
+  mutate(year = as.numeric(as.character(year)))
+
+### Carry number of fishing boats forward for missing years
+boat_data$nboats[1] <- 0
+boat_data$nboats <- loocf(boat_data$nboats)
+
+## Recode years from 1:n_years
+boat_data <- boat_data |> 
+  filter(year >= min(CPUE_data$year) & year <= max(CPUE_data$year))
+
+boat_data$year_num <- seq_along(boat_data$year)
+
+CPUE_data <- CPUE_data |> left_join(boat_data, by = "year") |> arrange(year)
+```
+
+The self-reported CPUE data show a clear decline over time:
+
+```{r cpue_population, echo = FALSE}
+colors <- c("dodgerblue3", "chartreuse4", "dodgerblue4", "#6bb522")
+
+CPUE_data |> 
+  ggplot(aes(year)) + 
+  geom_point(aes(y = CPUE / 2.5)) + 
+  geom_step(aes(y = nboats), 
+            data = add_row(boat_data, data.frame(year = c(1980, 2015), nboats = c(0, 8))), 
+            color = colors[1], linewidth = 1) +
+  labs(x = "Year", y = "Self-Reported CPUE (sharks per day)") + 
+  geom_point(
+    aes(y = nboats), 
+    data = boat_data |> filter(year %in% c(1985, 1996, 1999, 2000, 2001, 2002, 2004, 2013)), 
+    fill = colors[1], size = 2.5, shape = 21, color = "white", stroke = 1.5
+  ) + 
+  scale_y_continuous( 
+    labels = function(x) x * 2.5,
+    sec.axis = sec_axis(~ ., name = "Number of fishing boats"), 
+  ) + 
+  scale_x_continuous(breaks = seq(1980, 2015, 5), limits = c(1980, 2015)) +
+  coord_cartesian(clip = "off") + 
+  theme(
+    axis.line.y.right = element_line(color = colors[1]), 
+    axis.ticks.y.right = element_line(color = colors[1]), 
+    axis.text.y.right = element_text(color = colors[1]),
+    axis.title.y.right = element_text(color = colors[1]), 
+    panel.grid.minor.x = element_blank()
+  )
+```
+
+Teraina was, until near the end of the 20th century, sparsely inhabited: 
+
+```{r population, echo = FALSE}
+label_data <- data.frame(
+  year = c(1983, 2013, 2019),
+  label = c("earliest\nself-reported\nCPUE estimate", "Fisher\ninterviews", 
+            "Social-Ecological\nSurveys"), 
+  label_y = c(1700, 800, 400)
+)
+
+pop_data |> 
+  ggplot(aes(year, population)) + 
+  geom_vline(aes(xintercept = year), data = label_data, color = "dodgerblue3", 
+             linetype = "dashed", linewidth = 1) + 
+  geom_label(aes(label = label, y = label_y), data = label_data, hjust = 1, nudge_x = -1,
+             fill = "white", label.size = 0, color = "dodgerblue3", alpha = 0.8) + 
+  geom_line(linewidth = 1) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 2000)) + 
+  scale_x_continuous(breaks = seq(1940, 2020, 10)) + 
+  ylab("Teraina population") + 
+  coord_cartesian(clip = "off")
+```
+
+
+The CPUE data need to be adjusted for fisher bias using inventory data from stores of dried shark fins from 2013 (`fin_catch_data`), which are stored by fishers until larger ships visit the island to purchase them, and are thus a reliable estimate of fisher catch. The CPUE data have also need to be adjusted for the ratio of sharks caught which are grey reef sharks, the focal species of this case study. The assumptions implicit in these adjustments are that fisherman bias and the proportion of sharks caught which are grey reef sharks are constant over time. Thus, the CPUE data that are used to fit the model are derived from the reported CPUE, fin-derived CPUE, and proportion of shark fins identified as grey reef sharks as:
+
+$$
+\textrm{Adjusted CPUE}_{i,t}= \frac{\textrm{Fin-Derived CPUE}_{2013}}{\textrm{Reported CPUE}_{2013}}\times\text{P(grs)}\times\textrm{Reported CPUE}_{i,t}
+$$
+
+Where $i$ indicates the fisher and $t$ the year pertaining to the reported CPUE, and $\text{P(grs)} \approx 0.165$ is the proportion of total measured catch that included grey reef sharks:
+
+```{r cpue_data}
+### Add column to fin catch data for reported CPUE
+fin_catch_data <- fin_catch_data |> 
+  left_join(select(filter(CPUE_data, year == 2013), id, CPUE_reported = CPUE))
+
+### Fraction of identified sharks that are grey reef sharks
+shark_adj <- with(fin_id_data, ter_fin_count[species == "C. amblyrhynchos"]/
+                    sum(ter_fin_count[species != "Unidentified"])) 
+
+fin_catch_data$CPUE_fin <- 
+  with(fin_catch_data, (dorsal_fins)/((n_days/7)*sharking_days_wk))
+```
+
+Of sampled shark fins on Teraina, most of the fins were in fact *C. falciformis*, the silky shark:
+
+```{r pie_chart, echo = FALSE}
+pie_colors <- c("#324ea8", "#84b1f0", "#a5a3f0", "#9cf0db", "grey80")
+
+fin_id_data <- fin_id_data |> mutate(
+  label = ifelse(species != "Unidentified", paste0("*", species, "*"), species)
+)
+
+fin_id_data |> 
+  filter(ter_fin_count > 0) |> 
+  ggplot(aes(x = "", y = ter_fin_count, fill = label)) + 
+  geom_bar(stat = "identity", color = "white", linewidth = 0.8) + 
+  geom_text(aes(label = ter_fin_count), position = position_stack(vjust = 0.5), 
+            data = filter(fin_id_data, ter_fin_count > 5),
+            color = "white", fontface = "bold")  + 
+  coord_polar("y", start = 0) + 
+  scale_fill_manual(values = pie_colors) + 
+  labs(fill = "Species") + 
+  theme_void() + 
+  theme(legend.text = ggtext::element_markdown())
+```
+
+We adjust the reported catch per unit effort by dividing the fin-based CPUE from 2013 by the reported CPUE from the same year:
+
+```{r bc_factor}
+bc_factor <- mean(fin_catch_data$CPUE_fin/fin_catch_data$CPUE_reported)
+```
+
+The "bias correction factor" is approximately `r round(bc_factor, 3)`. Adjusting the CPUE accordingly:
+
+```{r}
+CPUE_data$CPUE_adj <- CPUE_data$CPUE * bc_factor * shark_adj
+```
+
+Plotting the adjusted CPUE over time:
+
+```{r echo = FALSE}
+CPUE_data |> ggplot(aes(year, CPUE_adj)) + geom_point() + labs(x = "Year", y = "Adjusted CPUE")
+```
+
+# Beverton-Holt Model
+
+We used a Beverton-Holt model to approximate the dynamics of the grey reef shark population on Teraina over time. We initialize the population at the carrying capacity $K$, which we approximate by taking previous estimates of the carrying capacity from nearby Palmyra atoll, and scaling it down based on the difference in the extent of reef habitat between the two islands, giving an estimate of 4546 individuals:
+
+$$
+N_0 = K = 4546
+$$
+
+For each time step ($\Delta t$ = 1 year) after $t = 0$, the number of grey reef sharks in the next time step is the number of individuals in the current time step, plus the change in population size due to natural processes, minus the number of reef sharks removed across the fishing season:
+
+$$
+N_{t + 1} = N_t^+ e^{-\bar{q}d_tB_t}
+$$
+
+Where $N_t^+$ is given by the Beverton-Holt model:
+
+$$
+N_t^+ = \frac{\lambda N_t}{1 + N_t\left( \frac{\lambda - 1}{K} \right)}
+$$
+
+and where $\bar{q}$ is the overall fisherman catchability, $B_t$ is the active number of fishing boats in year $t$, and $d_t$ is the number of fishing days in the fishing season for year $t$. It is given by a sigmoid function with a slope $\beta_d$, a midpoint $t_\text{mid}$, and a maximum number of fishing days $d_\text{max}$:
+
+$$
+d_t = \frac{d_\text{max}}{1 + e^{\left(-\beta_d \times (t - t_\text{mid}) \right)}}
+$$
+
+For higher slope values, the sigmoid evaluated at discrete years esentially becomes a step function:
+
+```{r echo = FALSE}
+### sigmoid curve for number of fishing days
+nfdays = function(t, dmax, midpoint, slope){
+  dmax/(1 + exp(-slope * (t - midpoint)))
+}
+
+nfdays_df <- data.frame(
+  slope = rep(c(0.2, 0.5, 1, 5), each = nrow(boat_data)), 
+  t = rep(boat_data$year, length(c(0.2, 0.5, 1, 5)))
+)
+nfdays_df$dt <- with(nfdays_df, nfdays(t, dmax = 120, midpoint = 2000, slope = slope))
+```
+
+```{r echo = FALSE}
+nfdays_df |> 
+  mutate(slope = factor(slope)) |> 
+  ggplot(aes(t, dt, color =slope)) + 
+  geom_step() + 
+  labs(x = "Year", y = "Number of Fishing Days") +
+  expand_limits(y = 0)
+```
+
+
+Finally, the expected catch per unit effort under this model is given by:
+
+$$
+\mu_{\text{CPUE}, i, t} = N_t^+ \left( 1 - e^{-q_i} \right) \; ; \; i \in (1, 2, \ldots, n_{\text{fisher}})
+$$
+
+Where each fisher has their own catchability $q_i$, which is connected to the overall catchability $\bar{q}$ as described below. The catch-per-unit effort estimates from this model are what connects the underlying population trends to the observed data.
+
+# Bayesian Model
+
+## Main model
+
+The full structure of the Bayesian model is:
+
+$$
+\begin{aligned}
+\text{CPUE}_{t, i} &\sim \text{LogNormal}(\log(\mu_{\text{CPUE}, t, i}), \sigma) \\
+N_{t + 1} &= N_t^+ e^{-\bar{q}d_tB_t} \; ; \;
+d_t = \frac{d_\text{max}}{1 + e^{\left(-\beta_d \times (t - t_\text{mid}) \right)}}
+\\
+\mu_{\text{CPUE}, t, i} &= N_t^+ \left( 1 - e^{-q_i} \right) \; ; \; i \in (1, 2, \ldots, n_{\text{fisher}}) \\
+N_t^+ &= \frac{\lambda N_t}{1 + N_t\left( \frac{\lambda - 1}{K} \right)} \\
+N_0 &= K \\
+q_i &\sim \text{LogNormal}(\bar{q}, \sigma_q) \\
+\bar{q} &\sim \text{Normal}(0.01, 0.05)[0, \infty] \\
+\sigma_q &\sim \text{Half-Normal}(0, 0.05) \\
+\text{logit}\left( \frac{d_\text{max}}{365} \right) &\sim \text{Normal}(\mu_\text{dmax}, \sigma_\text{dmax}) \\
+\lambda &\sim 1 + \text{Gamma}(\alpha_\lambda = \mu_\lambda^2/\sigma_\lambda^2, \beta_\lambda = \mu_\lambda/\sigma_\lambda^2) \\
+\sigma &\sim \text{Exponential}(3)
+\end{aligned}
+$$
+
+Where the first line indicates that we are assuming a log-normal likelihood, the next four lines are our deterministic model as described above, and the lines that follow are the priors.
+
+We chose to fix the slope parameter for the sigmoid fishing days function, because simulations and initial runs in Stan suggest that (with a midpoint at the year 2000) changing the value of the slope has little to no effect on the fit of our model to the reported CPUE data. The fitted model parameters are thus the catchability $q$ (at both the overall and fisher levels, as described below), the maximum number of fishing days $d_\text{max}$, the population finite growth rate $\lambda$, and a couple of error terms.
+
+The maximum number of fishing days and the population finite growth rate are empirical priors, with distributions estimated from the data. For the maximum number of fishing days:
+
+```{r fishing_days_prior}
+se <- function(x) sd(x)/sqrt(length(x))
+
+logit_days <- qlogis(fin_catch_data$sharking_days_wk / 7)
+
+fdays_prior <- list(mean = mean(logit_days), sd = se(logit_days))
+```
+
+Giving $\mu_\text{dmax} \approx$ `r round(mean(plogis(rnorm(10000, fdays_prior$mean, fdays_prior$sd)) * 365), 2)` and $\sigma_\text{dmax} \approx$ `r round(sd(plogis(rnorm(10000, fdays_prior$mean, fdays_prior$sd)) * 365), 2)`.
+
+For $\lambda$, $\mu_\lambda \approx$ `r round(lambda_mean, 3)` and $\sigma_\lambda \approx$ `r round(lambda_sd, 3)`.
+
+Because some fishers have multiple reported CPUE values (resulting in 39 data points from 17 fishers), these data are "clustered" by fisher, which necessitates the use of a hierarchical model. Here, we use a hierarchical prior for the catchability $q$, so that the mean catchability $\bar{q}$, which impacts the overall population trajectory, is drawn from a normal distribution with a standard deviation $\sigma_q$ estimated from the individual fisher-level catchabilities $q_i, \; i \in (1, 2, \ldots, n_{\text{fisher}})$, which do not impact the overall population trajectory, but do impact each fisher's CPUE:
+
+$$
+\begin{aligned}
+\log(q_i) &\sim \text{Normal}(\log(\bar{q}), \sigma_q)[0, \infty] \\
+\bar{q} &\sim \text{Normal}(0.01, 0.05)[0, \infty] \\
+\sigma_q &\sim \text{Half-Normal}(0, 0.05)
+\end{aligned}
+$$
+
+Because there are no empirical data to inform the catchability parameter, we'll use wide, uninformative priors.
+
+## "Full" model
+
+We additionally fit a model estimating the carrying capacity $K$ using an empirical prior following the estimate and standard error for the grey reef shark carrying capacity from Bradley et al. (2017), and applying weakly informative priors which allow for the slope and midpoints of the sigmoid function controlling the number of fishing days to vary within the interval [0, 20] and [1998, 2002] respectively: 
+
+$$
+\begin{aligned}
+K &\sim \text{Normal}(4546, 385) \\
+\text{logit}\left(\frac{\beta_d}{20}\right) &\sim \text{Normal}(0, 1) \\
+\text{logit}\left(\frac{t_\text{mid} - 1998}{4}\right) &\sim \text{Normal}(0, 1) \\
+\end{aligned}
+$$
+
+
+## "Reduced" model
+
+We also consider a simpler model where there is no sigmoid function controlling the number of fishing days over time, so that in other words fishing effort is simply scaled by the number of fishing boats:
+
+$$
+d_t = d_\text{max}
+$$
+
+# Model Sampling and Diagnostics
+
+Defining the data and parameters to be passed to the Stan model:
+
+```{r stan_data}
+K <- 4546
+
+## Recode fisher ID from 1:n_fisher
+CPUE_data$id <- as.numeric(as.factor(CPUE_data$id))
+
+### Data and fixed parameter list to pass to Stan model
+grs_stan_data <- list(
+  n_obs = nrow(CPUE_data), ## number of observations
+  n_fisher = length(unique(CPUE_data$id)), ## number of fishermen
+  fisher_id = CPUE_data$id, ## fishermen IDs
+  year = CPUE_data$year_num, ## years corresponding to observed CPUE
+  CPUE = CPUE_data$CPUE_adj, ## observed CPUE
+  n_boats = boat_data$nboats, ## number of boats over time
+  tmax = nrow(boat_data), ## maximum time step in data
+  K = K, ## carrying capacity
+  midpoint = boat_data$year_num[boat_data$year == 2000], ## sigmoid midpoint
+  slope = 10, ## slope of sigmoid fishing days curve,
+  lambda_alpha = lambda_alpha,
+  lambda_beta = lambda_beta,
+  mu_dmax = fdays_prior$mean, ## prior mean for d_max
+  sd_dmax = fdays_prior$sd ## sd of prior distribution for d_max
+)
+```
+
+## Initial values
+
+The $\lambda$ and $d_{max}$ parameters have empirical prior distributions derived above, but because there are no prior data to estimate the overall catchability $q$ and corresponding fisher-level catchabilities from, we'll give this parameter a wide prior. However, implausible starting values can cause the MCMC chains to become stuck on certain values of $q$, so we'll generate more plausible starting values randomly using the maximum likelihood estimate and standard errors for $q$, obtained by holding $d_{max}$ and $\lambda$ and the mean of their prior distributions. Standard errors are obtained using the Fisher information.
+
+```{r initial_values}
+## Function to return Normal negative log-likelihood
+beverton_holt_nll <- function(par, data) {
+  
+  n_obs <- length(data$CPUE)
+  t_max <- length(data$n_boats)
+  
+  N <- Np <- numeric(tmax)
+  N[1] <- data$K
+  
+  for (i in 1:t_max) {
+    Np[i] = ( data$lambda * N[i] )/ ( 1 + ( (data$lambda - 1) / data$K ) * N[i] )
+    if (i < t_max) N[i + 1] = 
+        Np[i] * exp(-exp(par["log_q"]) * nfdays(i, data$dmax, data$midpoint, data$slope))
+  }
+  
+  mu_cpue <- Np[data$year] * (1 - exp(-exp(par["log_q"])))
+  nll <- -sum(dnorm(data$CPUE, mean = mu_cpue, sd = exp(par["log_sigma"]), log = TRUE))
+  return(nll)
+  
+}
+
+## Initial values and input data
+mle_par <- c(log_q = log(0.01), log_sigma = log(0.5))
+mle_data <- append(grs_stan_data, list(lambda = lambda_mean, dmax = fdays_prior$mean))
+
+## Obtain maximum likelihood estimate and standard errors for q
+mle <- optim(mle_par, beverton_holt_nll, data = mle_data, hessian = TRUE)
+se <- sqrt(diag(solve(mle$hessian)))
+
+## Function to return random starting values for each chain
+q_init <- function(n = mle_data$n_fisher, logmu = mle$par["log_q"], logsd = se["log_q"]) {
+  q_sim = exp(rnorm(n, mean = logmu, sd = logsd))
+  list(log_q = log(mean(q_sim)), q_fisher = q_sim)
+}
+```
+
+## Intermediate Model
+
+Now, we'll draw 20,000 samples from the posterior across four chains. Initial catchability values are provided by the `q_init` function, and initial values for other parameters are drawn from their prior distributions.
+
+```{r sampling}
+### Compile Stan model
+grs_model <- stan_model(here("Stan", "GRS_Multilevel_Model.stan"))
+
+### set number of samples from the posterior distribution
+n_warmup <- 2000
+n_samples <- 7000
+
+## Sample from the posterior
+grs_samples <- sampling(
+  grs_model, 
+  data = grs_stan_data,
+  iter = n_samples, 
+  warmup = n_warmup,
+  control = list(adapt_delta = 0.99),
+  init = q_init,
+  chains = 4, 
+  cores = 4
+)
+```
+
+## R-hat
+
+All of the $\hat{R}$ values were very close to 1, suggesting the model has converged:
+
+```{r R_hat, echo = FALSE}
+model_summary <- as.data.frame(summary(grs_samples)$summary)
+r_hat <- na.omit(model_summary$Rhat)
+
+ggplot() + geom_histogram(aes(x = r_hat), binwidth = 0.00025) + 
+  labs(x = expression(hat(R)), y = "Frequency")
+```
+
+## Traceplots
+
+The model traceplots look healthy. For simplicity, I'm only plotting three of the main parameters of interest here, but none of the traceplots for the other parameters look pathological either.
+
+```{r traceplots, fig.height = 6, echo = FALSE}
+traceplots <- traceplot(grs_samples, pars = c("q", "dmax", "sigma_q", "lambda"), ncol = 2)
+
+traceplots$data |> 
+  mutate(parameter = case_when(
+    parameter == "sigma_q" ~ "sigma[q]", 
+    parameter == "dmax" ~ "d[max]", 
+    parameter == "q" ~ "bar(q)",
+    TRUE ~ as.character(parameter)
+  )) |> 
+  ggplot(aes(iteration, value, color = chain)) + 
+  geom_line() + 
+  facet_wrap(~parameter, labeller = label_parsed, ncol = 1,
+             scales = "free_y", strip.position = "left") + 
+  scale_color_brewer(palette = "RdYlBu") + 
+  theme(
+    legend.position = "bottom", 
+    strip.background = element_blank(), 
+    strip.text = element_text(size = 14), 
+    axis.title.y = element_blank(), 
+    strip.placement = "outside"
+  )
+```
+
+## Full Model
+
+Samping from the first alternative model specification (the "full" model):
+
+```{r}
+grs_model_alt <- stan_model(here("Stan", "GRS_Multilevel_Model_Full.stan"))
+
+grs_samples_alt <- sampling(
+  grs_model_alt, 
+  data = grs_stan_data,
+  iter = n_samples, 
+  warmup = n_warmup,
+  control = list(adapt_delta = 0.99),
+  init = q_init,
+  chains = 4, 
+  cores = 4
+)
+```
+
+## Reduced model
+
+And the second (the "reduced" model):
+
+```{r}
+grs_model_red <- stan_model(here("Stan", "GRS_Multilevel_Model_reduced.stan"))
+
+grs_samples_red <- sampling(
+  grs_model_red, 
+  data = grs_stan_data,
+  iter = n_samples, 
+  warmup = n_warmup,
+  control = list(adapt_delta = 0.99),
+  init = q_init,
+  chains = 4, 
+  cores = 4
+)
+```
+
+
+# Parameter Posterior Distributions
+
+## Intermediate Model
+
+Here is the summary table for the main parameters from the intermediate model:
+
+```{r}
+main_params <- model_summary[c("q", "dmax", "lambda", "sigma_q", "sigma_cpue"),]
+main_params <- main_params[,c("mean", "sd", "2.5%", "97.5%", "n_eff", "Rhat")]
+knitr::kable(main_params, digits = 5)
+```
+
+
+## Pairs plot
+
+Plotting (1, lower triangle) the posterior samples of the three main parameters from the intermediate model against each other colored by the joint (two-parameter) marginal density, (2, diagonal) the posterior density for each parameter with 80 and 95% credible intervals, and (3, upper triangle) the correlation between posterior samples for the parameters:
+
+```{r posterior_pairs, echo = FALSE, fig.height = 6, fig.width = 8}
+par_samples <- as.data.frame(extract(grs_samples, c("q", "dmax", "lambda")))
+
+ggally_pointdens <- function(data, mapping, N = 100, ...){
+  
+  get_density <- function(x, y, n ) {
+    dens <- MASS::kde2d(x = x, y = y, n = n)
+    ix <- findInterval(x, dens$x)
+    iy <- findInterval(y, dens$y)
+    ii <- cbind(ix, iy)
+    return(dens$z[ii])
+  }
+  
+  X <- eval_data_col(data, mapping$x)
+  Y <- eval_data_col(data, mapping$y)
+  
+  data$density <- get_density(x=X, y=Y, n=N)
+  
+  p <- ggplot(data, mapping) +
+    geom_point(aes(colour=density), ...) +
+    scale_color_viridis_c()      
+  p
+}
+
+ggally_denCIty <- function(data, mapping, n = 500, ...) {
+  
+  X <- eval_data_col(data, mapping$x)
+  x_dens <- density(X, from = min(X), to = max(X), n = n)
+  x_dens <- data.frame(x = x_dens$x, dens = x_dens$y)
+  X_ci1 <- quantile(X, c(0.025, 0.975))
+  X_ci2 <- quantile(X, c(0.1, 0.9))
+  X_mean <- mean(X)
+  X_mean_dens <- approxfun(x_dens$x, x_dens$dens)(X_mean)
+  
+  ggplot(data, mapping) + 
+    geom_area(aes(x = x, y = dens), data = x_dens, fill = "grey80",
+              inherit.aes = FALSE, color = "black") + 
+    geom_area(aes(x = x, y = dens), data = filter(x_dens, x >= X_ci1[1] & x <= X_ci1[2]), 
+              fill = "grey60", inherit.aes = FALSE, color = "black") + 
+    geom_area(aes(x = x, y = dens), data = filter(x_dens, x >= X_ci2[1] & x <= X_ci2[2]), 
+              fill = "grey40", inherit.aes = FALSE, color = "black") +
+    geom_segment(aes(x = X_mean, y = 0, xend = X_mean, yend = X_mean_dens),
+                 inherit.aes = FALSE) 
+  
+  
+}
+
+ggpairs(
+  par_samples, 
+  lower = list(continuous = ggally_pointdens),
+  diag = list(continuous = ggally_denCIty),
+  upper = list(continuous = GGally::wrap(ggally_cor, stars = F)),
+  columnLabels = c("bar(q)", "d[max]", "lambda"),
+  labeller = "label_parsed"
+) + 
+  theme(strip.background = element_blank(), 
+        strip.text = element_text(size = 14), 
+        axis.ticks = element_line(color = "black"), 
+        axis.text = element_text(color = "black"))
+```
+
+## Full Model
+
+Parameter posterior summary for the full model:
+
+```{r}
+summary_alt <- as.data.frame(summary(grs_samples_alt)$summary)
+params_alt <- summary_alt[c("q", "dmax", "lambda", "sigma_q", "sigma_cpue", "K", "midpoint", "slope"),]
+params_alt <- params_alt[,c("mean", "sd", "2.5%", "97.5%", "n_eff", "Rhat")]
+knitr::kable(params_alt, digits = 5)
+```
+
+## Reduced Model
+
+And for the reduced model:
+
+```{r}
+summary_red <- as.data.frame(summary(grs_samples_red)$summary)
+params_red <- summary_red[c("q", "dmax", "lambda", "sigma_q", "sigma_cpue"),]
+params_red <- params_red[,c("mean", "sd", "2.5%", "97.5%", "n_eff", "Rhat")]
+knitr::kable(params_red, digits = 5)
+```
+
+
+# Posteriors for CPUE, N, and Yield
+
+The mean CPUE and population size are parameters derived in the Stan model, so we can obtain posterior credible intervals for their means directly from Stan. Additionally, we can obtain posterior predictive intervals for the CPUE from Stan - this is an interval for the observed data (and thus includes the observation error term and assumes the data are lognormally distributed). No such distribution exists for the population size, as it does not have a likelihood.
+
+The yield is not a parameter in the Stan code but can be derived from the posteriors of the other parameters. To plot the 80% and 95% credible intervals for the yield, we obtain posterior distributions for $N^+$, $q$, and $d_{max}$, derive $d_t$ as defined above, and derive the yield as:
+
+$$
+Y_t = N^+ (1 - \exp(-q \times d_t \times n_{\text{boats}, t}))
+$$
+
+## Intermediate Model 
+
+Computing 80% and 95% credible intervals for the CPUE, yield, and latent abundance, as well as the 95% predictive interval for the CPUE:
+
+```{r}
+## Posterior distribution of the mean
+cpue_postmean <- tidybayes::spread_draws(grs_samples, mu_cpue[year, fisher_id])
+
+## Posterior predictive distribution
+cpue_postpred <- tidybayes::spread_draws(grs_samples, CPUE_pred[year, fisher_id])
+
+## Compute credible and predictive intervals for each year, averaging across fishers
+summarize_pred <- function(x, var) {
+  x |> 
+    group_by(year = year + 1982) |>   
+    reframe(
+      x = quantile(!!enquo(var), c(0.025, 0.1, 0.5, 0.9, 0.975)), 
+      q = c(0.025, 0.1, 0.5, 0.9, 0.975)
+    ) |> 
+    pivot_wider(names_from = q, values_from = x)
+}
+
+## Posterior and posterior predictive distributions for CPUE
+cpue_ci <- summarize_pred(cpue_postmean, mu_cpue)
+cpue_pi <- summarize_pred(cpue_postpred, CPUE_pred)
+
+# Posterior distribution for population size
+N_postmean <- tidybayes::spread_draws(grs_samples, N[year])
+N_ci <- summarize_pred(N_postmean, N)
+
+## Obtain posterior distribution for N+, q, and d_max
+Yield_postmean <- tidybayes::spread_draws(grs_samples, Np[year], q, dmax)
+
+## Derive posterior for the number of fishing days
+Yield_postmean$nfdays <- nfdays(
+  Yield_postmean$year, 
+  Yield_postmean$dmax,
+  grs_stan_data$midpoint,
+  grs_stan_data$slope
+)
+
+## Add number of fishing boats to data frame
+Yield_postmean <- left_join(
+  Yield_postmean, 
+  select(boat_data, year = year_num, nboats), 
+  by = "year"
+)
+
+## Derive posterior for the yield
+Yield_postmean <- Yield_postmean |> 
+  mutate(Yield = Np * (1 - exp(-q * nfdays * nboats)))
+
+Yield_ci <- summarize_pred(Yield_postmean, Yield)
+```
+
+Plotting these: 
+
+```{r post_plot_grid, include = FALSE}
+post_plot_data <- bind_rows(
+  list("Catch Per Unit Effort" = cpue_ci, "Abundance" = N_ci, "Fishery Yield" = Yield_ci), 
+  .id = "var"
+)
+
+cpue_plot <- cpue_ci |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.2, fill = colors[1], 
+              data = cpue_pi) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  geom_point(aes(x = year, y = CPUE_adj), data = mutate(CPUE_data, fisher_id = id)) + 
+  labs(x = "Year", y = "Catch Per Unit Effort") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+N_plot <- N_ci |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  labs(x = "Year", y = "Abundance") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+yield_plot <- Yield_ci |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  labs(x = "Year", y = "Fishery Yield") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+post_plot <- cowplot::plot_grid(
+  cpue_plot, yield_plot, N_plot, 
+  nrow = 2, labels = letters, label_x = 0.01, align = "hv"
+)
+
+post_legend <- data.frame(
+  x = rep(0.27, 3), 
+  y = c(0.875, 0.75, 0.5), 
+  label = c("95% PI", "95% CI", "80% CI")
+) |> 
+  ggplot(aes(x, y)) + 
+  annotate("rect", xmin = 0.15, xmax = 0.25, ymin = 0.05, ymax = 0.95, 
+           alpha = 0.2, fill = colors[1]) + 
+  annotate("rect", xmin = 0.15, xmax = 0.25, ymin = 0.2, ymax = 0.8, 
+           alpha = 0.4, fill = colors[1]) + 
+  annotate("rect", xmin = 0.15, xmax = 0.25, ymin = 0.3, ymax = 0.7, 
+           alpha = 0.4, fill = colors[1]) + 
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) + 
+  geom_text(aes(label = label), hjust = 0, color = "dodgerblue4", fontface = "bold") + 
+  theme_void()
+
+vp <- grid::viewport(width = 0.5, height = 0.4, x = 0.75, y = 0.25)
+
+png("figures/posterior_trends.png", 7.2, 5.5, "in", res = 500)
+print(post_plot)
+print(post_legend, vp = vp)
+dev.off()
+```
+
+
+![post_plot](figures/posterior_trends.png)\
+
+
+The estimated population size in 2013 is:
+
+```{r}
+round(c(
+  mean = mean(N_postmean$N[N_postmean$year + 1982 == 2013]), 
+  quantile(N_postmean$N[N_postmean$year + 1982 == 2013], c(0.025, 0.1, 0.9, 0.975))
+), 2)
+```
+
+## Full model
+
+Here are the same trends including uncertainty in the sigmoid fishing days function and the carrying capacity: 
+
+```{r include = FALSE}
+N_alt <- tidybayes::spread_draws(grs_samples_alt, N[year])
+N_ci_alt <- summarize_pred(N_alt, N)
+
+cpue_alt <- tidybayes::spread_draws(grs_samples_alt, mu_cpue[year, fisher_id])
+cpue_pred_alt <- tidybayes::spread_draws(grs_samples_alt, CPUE_pred[year, fisher_id])
+
+cpue_ci_alt <- summarize_pred(cpue_alt, mu_cpue)
+cpue_pi_alt <- summarize_pred(cpue_pred_alt, CPUE_pred)
+
+Yield_alt <- tidybayes::spread_draws(grs_samples_alt, Np[year], q, dmax, midpoint, slope)
+Yield_alt$nfdays <- with(Yield_alt, nfdays(year, dmax, midpoint, slope))
+Yield_alt <- Yield_alt |> left_join(select(boat_data, year = year_num, nboats), by = "year")
+Yield_alt <- Yield_alt |> mutate(Yield = Np * (1 - exp(-q * nfdays * nboats)))
+Yield_ci_alt <- summarize_pred(Yield_alt, Yield)
+
+post_plot_data_alt <- bind_rows(
+  list("Catch Per Unit Effort" = cpue_ci_alt, "N" = N_ci_alt, "Fishery yield" = Yield_ci_alt), 
+  .id = "var"
+)
+
+cpue_plot <- cpue_ci_alt |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.2, fill = colors[1], 
+              data = cpue_pi_alt) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  geom_point(aes(x = year, y = CPUE_adj), data = mutate(CPUE_data, fisher_id = id)) + 
+  labs(x = "Year", y = "Catch Per Unit Effort") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+N_plot <- N_ci_alt |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  labs(x = "Year", y = "Abundance") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+yield_plot <- Yield_ci_alt |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  labs(x = "Year", y = "Fishery Yield") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+post_plot_alt <- cowplot::plot_grid(
+  cpue_plot, yield_plot, N_plot, 
+  nrow = 2, labels = letters, label_x = 0.01, align = "hv"
+)
+
+png("figures/posterior_trends_full.png", 7.2, 5.5, "in", res = 500)
+print(post_plot_alt)
+print(post_legend, vp = vp)
+dev.off()
+```
+
+![post_plot_full](figures/posterior_trends_full.png)\
+
+
+The population size in 2013, as estimated using the full model, is: 
+
+```{r}
+round(c(
+  mean = mean(N_alt$N[N_alt$year + 1982 == 2013]), 
+  quantile(N_alt$N[N_alt$year + 1982 == 2013], c(0.025, 0.1, 0.9, 0.975))
+), 2)
+```
+
+
+## Reduced model
+
+```{r include = FALSE}
+N_red <- tidybayes::spread_draws(grs_samples_red, N[year])
+N_ci_red <- summarize_pred(N_red, N)
+
+cpue_red <- tidybayes::spread_draws(grs_samples_red, mu_cpue[year, fisher_id])
+cpue_pred_red <- tidybayes::spread_draws(grs_samples_red, CPUE_pred[year, fisher_id])
+
+cpue_ci_red <- summarize_pred(cpue_red, mu_cpue)
+cpue_pi_red <- summarize_pred(cpue_pred_red, CPUE_pred)
+
+Yield_red <- tidybayes::spread_draws(grs_samples_red, Np[year], q, dmax)
+Yield_red$nfdays <- Yield_red$dmax
+Yield_red <- Yield_red |> left_join(select(boat_data, year = year_num, nboats), by = "year")
+Yield_red <- Yield_red |> mutate(Yield = Np * (1 - exp(-q * nfdays * nboats)))
+Yield_ci_red <- summarize_pred(Yield_red, Yield)
+
+post_plot_data_red <- bind_rows(
+  list("Catch Per Unit Effort" = cpue_ci_red, "N" = N_ci_red, "Fishery yield" = Yield_ci_red), 
+  .id = "var"
+)
+
+cpue_plot <- cpue_ci_red |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.2, fill = colors[1], 
+              data = cpue_pi_red) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  geom_point(aes(x = year, y = CPUE_adj), data = mutate(CPUE_data, fisher_id = id)) + 
+  labs(x = "Year", y = "Catch Per Unit Effort") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+N_plot <- N_ci_red |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  labs(x = "Year", y = "Abundance") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+yield_plot <- Yield_ci_red |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) + 
+  labs(x = "Year", y = "Fishery Yield") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5))
+
+post_plot_red <- cowplot::plot_grid(
+  cpue_plot, yield_plot, N_plot, 
+  nrow = 2, labels = letters, label_x = 0.01, align = "hv"
+)
+
+png("figures/posterior_trends_red.png", 7.2, 5.5, "in", res = 500)
+print(post_plot_red)
+print(post_legend, vp = vp)
+dev.off()
+```
+
+![post_plot_red](figures/posterior_trends_red.png)\
+
+
+## Model comparison
+
+```{r model_comparison, include = FALSE}
+loo_tab <- loo::loo_compare(loo(grs_samples), loo(grs_samples_alt), loo(grs_samples_red))
+
+log_lik <- data.frame(
+  model = rep(c("full", "intermediate", "reduced"), each = 20000), 
+  loglik = c(
+    rowSums(loo::extract_log_lik(grs_samples_alt)), 
+    rowSums(loo::extract_log_lik(grs_samples)), 
+    rowSums(loo::extract_log_lik(grs_samples_red))
+  )
+)
+
+cpue_ci_all <- bind_rows(list(full = cpue_ci_alt, intermediate = cpue_ci, reduced = cpue_ci_red), 
+                         .id = "model")
+
+N_ci_all <- bind_rows(list(full = N_ci_alt, intermediate = N_ci, reduced = N_ci_red), 
+                      .id = "model")
+
+yield_ci_all <- bind_rows(list(full = Yield_ci_alt, intermediate = Yield_ci, reduced = Yield_ci_red), 
+                          .id = "model")
+
+colors <- c("#348D78", "#E66D3B", "#124578")
+
+loglik <- log_lik |> 
+  ggplot(aes(x = loglik)) + 
+  geom_density(aes(fill = model), alpha = 0.5) + 
+  scale_y_continuous(limits = c(0, 0.5), expand = c(0, 0)) + 
+  scale_x_continuous(limits = c(15, 27)) + 
+  scale_fill_manual(values = colors) + 
+  labs(x = "Log likelihood", y = "Density") + 
+  theme_bw() + 
+  theme(legend.position = "none") + 
+  coord_cartesian(clip = "off")
+
+cpue_all <- cpue_ci_all |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`, color = model, fill = model), 
+              alpha = 0.2, linetype = "dashed") + 
+  geom_line(aes(color = model), size = 1.2) + 
+  geom_point(aes(x = year, y = CPUE_adj), data = mutate(CPUE_data, fisher_id = id)) + 
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values = colors) +
+  labs(x = "Year", y = "Catch Per Unit Effort") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5)) + 
+  theme(legend.position = "none") + 
+  coord_cartesian(clip = "off")
+
+N_all <- N_ci_all |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`, color = model, fill = model), 
+              alpha = 0.2, linetype = "dashed") + 
+  geom_line(aes(color = model), size = 1.2) + 
+  labs(x = "Year", y = "Abundance") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5)) + 
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values = colors) + 
+  theme(legend.position = "none") + 
+  coord_cartesian(clip = "off")
+  
+yield_all <- yield_ci_all |> 
+  ggplot(aes(year, `0.5`)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`, color = model, fill = model), 
+              alpha = 0.2, linetype = "dashed") + 
+  geom_line(aes(color = model), size = 1.2) + 
+  labs(x = "Year", y = "Fishery Yield") + 
+  scale_x_continuous(breaks = seq(1985, 2010, 5)) + 
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values = colors) + 
+  theme(legend.position = "none") + 
+  coord_cartesian(clip = "off")
+
+legend_plot <- log_lik |> sample_n(1000) |> ggplot(aes(loglik, fill = model)) + geom_bar() + 
+  scale_fill_manual(values = colors) + theme(legend.position = "bottom") + 
+  guides(fill = guide_legend(title.position = "top", title.hjust = 0.5))
+legend <- cowplot::get_plot_component(legend_plot, "guide-box", return_all = TRUE)[[3]]
+
+post_comparison <- cowplot::plot_grid(cowplot::plot_grid(
+  cpue_all, N_all, yield_all, loglik,
+  nrow = 2, labels = letters, label_x = 0.01, align = "hv"
+), legend, nrow = 2, rel_heights = c(1, 0.15)) + 
+  theme(plot.background = element_rect(fill = "white", color = NA))
+
+png("figures/posterior_trends_comparison.png", 7.2, 5.5, "in", res = 500)
+print(post_comparison)
+dev.off()
+```
+![post_comparison](figures/posterior_trends_comparison.png)\
+
+
+# Scenarios
+
+## 2013 - 2030
+
+Finally, we can project the model forward in time (here I'll project it to 2030), evaluating the impact of reducing the amount of fishing effort, and including uncertainty in effort $d_{max}$, the finite growth rate $\lambda$, and the catchability $q$.
+
+```{r}
+## Parameters which impact underlying population size
+par_post <- tidybayes::spread_draws(grs_samples, lambda, q, dmax)
+
+## Initial population sizes - N in 2013
+No_post <- N_postmean |> ungroup() |> filter(year == max(CPUE_data$year_num))
+tmax <- (2030 - max(CPUE_data$year)) + 1
+nboats <- boat_data$nboats[which.max(boat_data$year)]
+
+## Function to simulate Beverton-Holt model
+beverton_holt <- function(No, tmax, lambda, q, fdays, nboats, K) {
+  
+  N <- Np <- numeric(tmax)
+  N[1] <- No
+  
+  for (i in 1:tmax) {
+    Np[i] <- lambda * N[i] / ( 1 + ( ( lambda - 1 ) / K ) * N[i] )
+    if (i < tmax) {
+      N[i + 1] = Np[i] * exp(-q * fdays * nboats);
+    }
+  }
+  
+  Yield = Np * (1 - exp(-q * fdays * nboats))
+  
+  data.frame(N, Np, Yield)
+  
+}
+
+## Percent decrease in number of fishing days
+fdays_seq <- seq(0, 1, 0.2)
+
+## List to store simulations in
+sim_list <- vector("list", nrow(par_post) * length(fdays_seq))
+index <- 1
+
+## Simulate data up to 2030
+for (i in 1:nrow(par_post)) {
+  for (j in 1:length(fdays_seq)) {
+    fdays <- par_post$dmax[i] * fdays_seq[j]
+    sim_ij <- beverton_holt(
+        No = No_post$N[i], tmax = tmax, lambda = par_post$lambda[i], 
+        q = par_post$q[i], fdays = fdays, nboats = nboats, K = K
+      )
+    sim_list[[index]] <- data.frame(
+      year = max(CPUE_data$year):2030, 
+      N = sim_ij$N, 
+      Yield = sim_ij$Yield,
+      percent = paste0((1 - fdays_seq[j])*100, "%")
+    )
+    index <- index + 1
+  }
+}
+
+sim_df <- do.call("rbind", sim_list) 
+
+sim_df <- sim_df |>
+  mutate(
+    percent = factor(
+        paste(percent, "reduction"), 
+          levels = paste(paste0(fdays_seq * 100, "%"), "reduction")
+          ), 
+         percent = forcats::fct_recode(
+           percent,
+           "No reduction" = "0% reduction",
+           "No fishing" = "100% reduction"
+         ))
+
+sim_summary <- sim_df |> 
+    group_by(year, percent) |>   
+    reframe(
+      N = quantile(N, c(0.025, 0.1, 0.5, 0.9, 0.975)), 
+      Yield = quantile(Yield, c(0.025, 0.1, 0.5, 0.9, 0.975)), 
+      q = c(0.025, 0.1, 0.5, 0.9, 0.975)
+    ) |> 
+    pivot_wider(names_from = q, values_from = c(N, Yield))
+```
+
+First, the population size:
+
+```{r echo = FALSE}
+colors <- c("dodgerblue3", "chartreuse4", "dodgerblue4", "#6bb522")
+
+N_ci |> 
+  filter(year >= 2010) |> 
+  ggplot(aes(year)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `N_0.025`, ymax = `N_0.975`, group = percent), alpha = 0.4,
+              data = sim_summary, fill = colors[2]) + 
+  geom_ribbon(aes(ymin = `N_0.1`, ymax = `N_0.9`, group = percent), alpha = 0.4,
+              data = sim_summary, fill = colors[2]) + 
+  geom_line(aes(y = `N_0.5`, group = percent), color = colors[2], 
+            size = 1.2, data = sim_summary) + 
+  geom_line(aes(y = `0.5`), color = colors[1], size = 1.2) + 
+  scale_x_continuous(
+    breaks = seq(2010, 2030, 5), 
+    labels = function(x) ifelse(x == 2010, "2010", str_sub(x, 3, 4))
+  ) + 
+  facet_wrap(~percent) + 
+  geom_vline(xintercept = 2013, color = "black", linetype = "dashed") + 
+  labs(x = "Year", y = "Abundance") + 
+  theme(strip.background = element_blank())
+```
+
+And the yield:
+
+```{r echo = FALSE}
+Yield_ci |> 
+  filter(year >= 2010) |> 
+  ggplot(aes(year)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.4, fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `Yield_0.025`, ymax = `Yield_0.975`, group = percent), 
+              alpha = 0.4, data = sim_summary, fill = colors[2]) + 
+  geom_ribbon(aes(ymin = `Yield_0.1`, ymax = `Yield_0.9`, group = percent), alpha = 0.4,
+              data = sim_summary, fill = colors[2]) + 
+  geom_line(aes(y = `Yield_0.5`, group = percent), color = colors[2], 
+            size = 1.2, data = sim_summary) + 
+  geom_line(aes(y = `0.5`), color = colors[1], size = 1.2) + 
+  facet_wrap(~percent) + 
+  geom_vline(xintercept = 2013, color = "black", linetype = "dashed") + 
+  scale_x_continuous(
+    breaks = seq(2010, 2030, 5), 
+    labels = function(x) ifelse(x == 2010, "2010", str_sub(x, 3, 4))
+  ) + 
+  labs(x = "Year", y = "Fishery Yield")
+```
+
+We can also plot the probability of population collapse over time, where a "collapsed" population is defined as having declined by 90% or more. At the 2013 level of fishing effort, the model predicts a near-100% probability of collapse by 2022-2024:
+
+```{r}
+collapse_prob <- sim_df |> 
+  group_by(year, percent) |> 
+  summarize(p = sum(N < (0.1 * K))/n(), .groups = "drop") |> 
+  ungroup()
+```
+
+```{r echo = FALSE}
+collapse_prob |> 
+  ggplot(aes(year, p, group = percent, color = percent)) +
+  geom_line() +
+  labs(x = "Year", y = "Probability of Collapse") + 
+  theme(legend.title = element_blank()) +
+  scale_colour_viridis_d(option = "mako", end = 0.8) + 
+  scale_x_continuous(breaks = seq(2014, 2030, 2))
+```
+
+
+## 2023 - 2040
+
+Let's now assume that fishing has continued since 2013 without reductions in effort, and examine the effects on reducing fishing effort from now onward (I've hidden the code here because it's redundant). For the population size in 2023, we have: 
+
+```{r}
+## Initial population sizes - N in 2023
+No_2023 <- sim_df |> filter(year == 2023 & percent == "No reduction")
+
+round(c(
+  mean = mean(No_2023$N), quantile(No_2023$N, c(0.025, 0.1, 0.9, 0.975))
+), 2)
+```
+
+
+```{r echo = FALSE}
+tmax <- (2040 - 2023) + 1
+
+## List to store simulations in
+sim_list_22 <- vector("list", nrow(par_post) * length(fdays_seq))
+index <- 1
+
+## Simulate data up to 2030
+for (i in 1:nrow(par_post)) {
+  for (j in 1:length(fdays_seq)) {
+    fdays <- par_post$dmax[i] * fdays_seq[j]
+    sim_ij <- beverton_holt(
+        No = No_2023$N[i], tmax = tmax, lambda = par_post$lambda[i], 
+        q = par_post$q[i], fdays = fdays, nboats = nboats, K = K
+      )
+    sim_list_22[[index]] <- data.frame(
+      year = 2023:2040, 
+      N = sim_ij$N, 
+      Yield = sim_ij$Yield,
+      percent = paste0((1 - fdays_seq[j])*100, "%")
+    )
+    index <- index + 1
+  }
+}
+
+sim_df_22 <- do.call("rbind", sim_list_22) 
+
+sim_df_22 <- sim_df_22 |>
+  mutate(
+    percent = factor(
+        paste(percent, "reduction"), 
+          levels = paste(paste0(fdays_seq * 100, "%"), "reduction")
+          ), 
+         percent = forcats::fct_recode(
+           percent,
+           "No reduction" = "0% reduction",
+           "No fishing" = "100% reduction"
+         ))
+
+sim_summary_22 <- sim_df_22 |> 
+    group_by(year, percent) |>   
+    reframe(
+      N = quantile(N, c(0.025, 0.1, 0.5, 0.9, 0.975)), 
+      Yield = quantile(Yield, c(0.025, 0.1, 0.5, 0.9, 0.975)), 
+      q = c(0.025, 0.1, 0.5, 0.9, 0.975)
+    ) |> 
+    pivot_wider(names_from = q, values_from = c(N, Yield))
+```
+
+First, plotting the population trajectory:
+
+```{r echo = FALSE}
+sim_13_22 <- sim_summary |> 
+  filter(year <= 2023 & percent == "No reduction") |> 
+  select(-percent)
+
+N_ci |> 
+  filter(year >= 2010) |> 
+  ggplot(aes(year)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.5, fill = colors[3]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.5, fill = colors[3]) + 
+  geom_ribbon(aes(ymin = `N_0.025`, ymax = `N_0.975`), alpha = 0.5,
+              data = sim_13_22, fill = colors[2]) + 
+  geom_ribbon(aes(ymin = `N_0.1`, ymax = `N_0.9`), alpha = 0.5,
+              data = sim_13_22, fill = colors[2]) + 
+  geom_line(aes(y = `N_0.5`), color = colors[2], size = 1.2, 
+            data = sim_13_22) + 
+  geom_ribbon(aes(ymin = `N_0.025`, ymax = `N_0.975`, group = percent), alpha = 0.5,
+              data = sim_summary_22, fill = colors[4]) + 
+  geom_ribbon(aes(ymin = `N_0.1`, ymax = `N_0.9`, group = percent), alpha = 0.5,
+              data = sim_summary_22, fill = colors[4]) + 
+  geom_line(aes(y = `N_0.5`, group = percent), color = colors[4], 
+            size = 1.2, data = sim_summary_22) + 
+  geom_line(aes(y = `0.5`), color = colors[3], size = 1.2) + 
+  scale_x_continuous(
+    breaks = seq(2010, 2040, 5), 
+    labels = function(x) ifelse(x == 2010, "2010", str_sub(x, 3, 4))
+  ) + 
+  facet_wrap(~percent) + 
+  geom_vline(xintercept = c(2013, 2023), color = "black", linetype = "dashed") + 
+  labs(x = "Year", y = "Abundance")
+```
+
+And now the yield:
+
+```{r echo = FALSE}
+Yield_ci |> 
+  filter(year >= 2010) |> 
+  ggplot(aes(year)) + 
+  geom_ribbon(aes(ymin = `0.025`, ymax = `0.975`), alpha = 0.5, fill = colors[3]) + 
+  geom_ribbon(aes(ymin = `0.1`, ymax = `0.9`), alpha = 0.5, fill = colors[3]) + 
+  geom_ribbon(aes(ymin = `Yield_0.025`, ymax = `Yield_0.975`), alpha = 0.5,
+              data = sim_13_22, fill = colors[2]) + 
+  geom_ribbon(aes(ymin = `Yield_0.1`, ymax = `Yield_0.9`), alpha = 0.5,
+              data = sim_13_22, fill = colors[2]) + 
+  geom_line(aes(y = `Yield_0.5`), color = colors[2], size = 1.2, 
+            data = sim_13_22) + 
+  geom_ribbon(aes(ymin = `Yield_0.025`, ymax = `Yield_0.975`, group = percent), alpha = 0.5,
+              data = sim_summary_22, fill = colors[4]) + 
+  geom_ribbon(aes(ymin = `Yield_0.1`, ymax = `Yield_0.9`, group = percent), alpha = 0.5,
+              data = sim_summary_22, fill = colors[4]) + 
+  geom_line(aes(y = `Yield_0.5`, group = percent), color = colors[4], 
+            size = 1.2, data = sim_summary_22) + 
+  geom_line(aes(y = `0.5`), color = colors[3], size = 1.2) + 
+  scale_x_continuous(
+    breaks = seq(2010, 2040, 5), 
+    labels = function(x) ifelse(x == 2010, "2010", str_sub(x, 3, 4))
+  ) + 
+  facet_wrap(~percent) + 
+  geom_vline(xintercept = c(2013, 2023), color = "black", linetype = "dashed") + 
+  labs(x = "Year", y = "Fishery Yield")
+```
+
+And now the probability of collapse - this isn't super helpful, since (assuming no reduction in effort), each of these scenarios start in 2023 with a near-zero probability of collapse.
+
+```{r echo = FALSE}
+collapse_prob_22 <- sim_df_22 |> 
+  group_by(year, percent) |> 
+  summarize(p = sum(N < (0.1 * K))/n(), .groups = "drop") |> 
+  ungroup()
+
+collapse_prob_22 |> 
+  ggplot(aes(year, p, group = percent, color = percent)) +
+  geom_line() +
+  geom_line(data = filter(collapse_prob, year <= 2023)) +
+  geom_line(data = filter(collapse_prob_22, percent == "No reduction")) +
+  labs(x = "Year", y = "Probability of Collapse") + 
+  theme(legend.title = element_blank(), 
+        legend.position = "top") +
+  scale_colour_viridis_d(option = "mako", end = 0.8) + 
+  scale_x_continuous(breaks = seq(2014, 2040, 4))
+```
+
+## 2016 fishing ban
+
+Emulating a scenario in which fishing continued at a similar level of effort until 2016, and after which ceased:
+
+```{r}
+tmax <- (2040 - 2016) + 1
+
+No_2016 <- sim_df |> filter(year == 2016 & percent == "No reduction")
+
+## List to store simulations in
+sim_list_ban <- vector("list", nrow(par_post))
+
+## Simulate data up to 2030
+for (i in 1:nrow(par_post)) {
+  sim_ij <- beverton_holt(
+    No = No_2016$N[i], tmax = tmax, lambda = par_post$lambda[i], 
+    q = par_post$q[i], fdays = 0, nboats = nboats, K = K
+  )
+  sim_list_ban[[i]] <- data.frame(year = 2016:2040, N = sim_ij$N)
+}
+
+sim_df_ban <- do.call("rbind", sim_list_ban) 
+
+sim_summary_ban <- sim_df_ban |> 
+    group_by(year) |>   
+    reframe(
+      N = quantile(N, c(0.025, 0.1, 0.5, 0.9, 0.975)), 
+      q = c(0.025, 0.1, 0.5, 0.9, 0.975)
+    ) |> 
+    pivot_wider(names_from = q, values_from = N)
+```
+
+In 2019, the year that the Kiribati village resource and ecological surveys ([Golden et al. 2022](https://www.frontiersin.org/articles/10.3389/fpubh.2022.890381/full)), the expected population size under this scenario is:
+
+```{r}
+(N_2019_ban <- round(c(
+  mean = mean(sim_df_ban$N[sim_df_ban$year == 2019]), 
+  quantile(sim_df_ban$N[sim_df_ban$year == 2019], c(0.025, 0.1, 0.9, 0.975))
+), 2))
+```
+
+
+# Maximum Sustainable Yield
+
+For the Beverton-Holt model, the population size at MSY is:
+
+$$
+N_\text{MSY} = K \frac{\sqrt{\lambda} - 1}{\lambda - 1}
+$$
+
+Accordingly, MSY is given by:
+
+$$
+\text{MSY} = \frac{\lambda N_\text{MSY}}{1 + N_\text{MSY}\left( \frac{\lambda - 1}{K} \right)} - N_\text{MSY}
+$$
+
+We can compute MSY for each sample of the posterior to obtain point estimates and credible intervals:
+
+```{r}
+par_post <- par_post |> 
+  mutate(
+    N_msy = K * (sqrt(lambda) - 1)/(lambda - 1), 
+    MSY = (lambda * N_msy)/(1 + N_msy * (lambda - 1)/K) - N_msy
+  )
+
+mcmc_areas(par_post[,"MSY"])
+```
+
+The mean MSY is about `r round(mean(par_post$MSY), 0)`:
+
+```{r}
+round(c(unclass(summary(par_post$MSY)), sd = sd(par_post$MSY)), 2)
+```
+
+And the 95% credible interval is:
+
+```{r}
+round(quantile(par_post$MSY, c(0.025, 0.975)), 2)
+```
+
+During 2002, the year with the highest estimated yield, the posterior median was about `r round(median(Yield_postmean$Yield[Yield_postmean$year + 1982 == 2002])/median(par_post$MSY), 0)` times the posterior median for MSY:
+
+```{r}
+knitr::kable(round(Yield_ci[which.max(Yield_ci$`0.5`),], 2))
+```
+
+We can also obtain the effort required to achieve MSY in boat-days:
+
+$$
+\begin{aligned}
+N_{t + 1} &= N_t^+ e^{-\bar{q}d_tB_t} \\
+N_\text{MSY} &= (N_\text{MSY} + \text{MSY}) e^{-\bar{q}dB} \\
+\bar{q}dB &= - \log\left(\frac{N_\text{MSY}}{N_\text{MSY} + \text{MSY}}\right) \\
+E &= - \frac{\log\left(\frac{N_\text{MSY}}{N_\text{MSY} + \text{MSY}}\right)}{\bar{q}}; E = dB
+\end{aligned}
+$$
+
+Here is the posterior distribution of the number of boat-days needed to obtain MSY:
+
+```{r}
+par_post <- par_post |> mutate(E_msy = -log(N_msy/(N_msy + MSY))/q)
+
+mcmc_areas(par_post[,"E_msy"])
+
+round(c(unclass(summary(par_post$E_msy)), sd = sd(par_post$E_msy)), 2)
+
+round(quantile(par_post$E_msy, c(0.025, 0.975)), 2)
+```
+
+If we divide this by 8 (the number of motorized fishing boats in 2013), we can see this gives a median of about `r round(mean(par_post$E_msy/8), 0)` fishing days per boat per year.
+
+```{r}
+mcmc_areas(par_post[,"E_msy"]/8)
+
+round(unclass(summary(par_post$E_msy/8)), 2)
+
+round(quantile(par_post$E_msy/8, c(0.025, 0.975)), 2)
+```
+
+Fishing mortality (as a proportion of the population) at MSY is given by:
+
+$$
+F_\text{MSY} = \frac{1}{2}\log(\lambda)
+$$
+
+This gives a posterior median and credible interval of:
+
+```{r}
+par_post <- par_post |> mutate(F_msy = log(lambda)/2)
+
+round(c(unclass(summary(par_post$F_msy)), sd = sd(par_post$F_msy)), 4)
+
+round(quantile(par_post$F_msy, c(0.025, 0.975)), 4)
+```
+
+We can also plot these variables as a function of $\lambda$, with the posterior mean and 80/95% credible intervals in green and the the prior mean indicated by black point:
+
+```{r}
+lambda_plot_data <- tibble(
+  lambda     = seq(from = 1.01, to = 1.3, by= 0.0001),
+  `F[MSY]`   = log(lambda)/2, # corresponding fishing mortalities at MSY
+  `1/F[MSY]` = 1/`F[MSY]`,     # life expectancy if natural mortality were zero
+  `N[MSY]`   = sapply(lambda, function(lam){K * (sqrt(lam) - 1)/(lam - 1)}), # MSY stock
+  MSY        = (lambda * `N[MSY]`/(1 + `N[MSY]` * ((lambda - 1)/K ))) - `N[MSY]`
+)
+```
+
+```{r fig.height = 3, fig.width = 8, echo = FALSE}
+line_plot <- function(data, var) {
+  
+  var <- enquo(var)
+  
+  data |> 
+  ggplot(aes(lambda, !!var)) +
+  geom_line(size = 0.75, lineend = "round") + 
+  geom_line(data = data |> 
+              filter(lambda >= round(quantile(par_post$lambda, 0.025), digits = 4) & 
+                       lambda <= round(quantile(par_post$lambda, 0.975), digits = 4)), 
+            color = "white", size = 3, lineend = "round") +
+  geom_line(data = data |> 
+              filter(lambda >= round(quantile(par_post$lambda, 0.025), digits = 4) & 
+                       lambda <= round(quantile(par_post$lambda, 0.975), digits = 4)), 
+            color = "chartreuse3", size = 1.5, lineend = "round") + 
+  geom_line(data = data |> 
+              filter(lambda >= round(quantile(par_post$lambda, 0.1), digits = 4) & 
+                       lambda <= round(quantile(par_post$lambda, 0.9), digits = 4)), 
+            color = "chartreuse3", size = 2.5, lineend = "round") +
+  geom_point(data = data |> 
+               filter(lambda == round(mean(par_post$lambda), digits = 4)), 
+             color = "chartreuse3", size = 3.5, shape = 21, stroke = 1, fill = "white") +
+  geom_point(data = data |> 
+               filter(lambda == round(lambda_mean, digits = 4)), 
+             color = "white", size = 2.5, shape = 21, stroke = 1, fill = "black") + 
+  labs(x = expression(lambda), y = rlang::parse_expr(quo_name(var)))
+}
+
+cowplot::plot_grid(
+  line_plot(lambda_plot_data, `N[MSY]`), 
+  line_plot(lambda_plot_data, `MSY`), 
+  line_plot(lambda_plot_data, `F[MSY]`), 
+  nrow = 1, labels = letters, align = "v", 
+  label_x = 0.01
+)
+```
+
+# Recovery trajectory
+
+Allowing the population to recover up to 2150 after ceasing fishing in 2016, we can see that the posterior median does not reach the posterior median for $N_\text{MSY}$ until around 2060:
+
+```{r}
+tmax <- (2150 - 2016) + 1
+
+## List to store simulations in
+recovery_sim <- vector("list", nrow(par_post))
+
+## Simulate data up to 2030
+for (i in 1:nrow(par_post)) {
+  sim_i <- beverton_holt(
+    No = No_2016$N[i], tmax = tmax, lambda = par_post$lambda[i], 
+    q = par_post$q[i], fdays = 0, nboats = nboats, K = K
+  )
+  recovery_sim[[i]] <- data.frame(year = 2016:2150, N = sim_i$N)
+}
+
+recovery_sim <- do.call("rbind", recovery_sim) 
+
+recovery_summary <- recovery_sim |> 
+  group_by(year) |>   
+  reframe(
+    N = quantile(N, c(0.025, 0.1, 0.5, 0.9, 0.975)), 
+    q = c(0.025, 0.1, 0.5, 0.9, 0.975)
+  ) |> 
+  mutate(q = paste0("N_", q)) |>
+  pivot_wider(names_from = q, values_from = N)
+```
+
+
+```{r echo = FALSE}
+recovery_summary |>
+  ggplot(aes(x = year, y = `N_0.5`)) + 
+  geom_hline(yintercept = median(par_post$N_msy), linetype = "longdash") + 
+  geom_text(aes(x = 2020, y = median(par_post$N_msy) + 200, label = "N[MSY]"), 
+            parse = TRUE, size = 5) +
+  geom_ribbon(aes(ymin = `N_0.025`, ymax = `N_0.975`), alpha = 0.5,
+              fill = colors[1]) + 
+  geom_ribbon(aes(ymin = `N_0.1`, ymax = `N_0.9`), alpha = 0.5,
+              fill = colors[1]) + 
+  geom_line(color = colors[1], size = 1.2) +
+  scale_x_continuous(breaks = seq(2010, 2150, 10)) + 
+  labs(x = "Year", y = "N")
+```
+
+The posterior median population size reaches $N_{MSY}$ in `r (year_nmsy <- min(recovery_summary$year[recovery_summary$N_0.5 > median(par_post$N_msy)]))`, the credible interval for the population size crosses this threshold as early as `r min(recovery_summary$year[recovery_summary$N_0.975 > median(par_post$N_msy)])` and as late as `r min(recovery_summary$year[recovery_summary$N_0.025 > median(par_post$N_msy)])`. The credible interval for the population size in `r year_nmsy` is `r paste0("(", paste(round(as.numeric(recovery_summary[recovery_summary$year == year_nmsy, c("N_0.025", "N_0.975"), drop = TRUE])), collapse = ", "), ")")`.
